@@ -1,0 +1,165 @@
+# Flash Attention 4 Source Map
+:label:`chap_fa4_source`
+
+The current Flash Attention 4 implementation lives in:
+
+```text
+/home/tlopexh/tirx-kernels/tirx_kernels/attention/flash_attention4.py
+```
+
+This appendix does not duplicate the whole file. The source changes faster than the tutorial, so this page maps the current source regions to the concepts from Chapter 6. Use the `tirx-kernels` file as the source of truth.
+
+## Entry Point
+
+The kernel is a constexpr-specialized persistent kernel:
+
+```python
+@Tx.jit(persistent=True)
+def _kernel(
+    Q: Tx.Buffer((BATCH_SIZE, SEQ_LEN_Q, NUM_QO_HEADS, HEAD_DIM), "float16"),
+    K: Tx.Buffer((BATCH_SIZE, SEQ_LEN_KV, NUM_KV_HEADS, HEAD_DIM), "float16"),
+    V: Tx.Buffer((BATCH_SIZE, SEQ_LEN_KV, NUM_KV_HEADS, HEAD_DIM), "float16"),
+    O: Tx.Buffer((BATCH_SIZE, SEQ_LEN_Q, NUM_QO_HEADS, HEAD_DIM), "float16"),
+    profiler_buffer: Tx.Buffer((PROFILER_BUFFER_SIZE,), "uint64"),
+    *,
+    BATCH_SIZE: Tx.constexpr,
+    SEQ_LEN_Q: Tx.constexpr,
+    SEQ_LEN_KV: Tx.constexpr,
+    NUM_QO_HEADS: Tx.constexpr,
+    NUM_KV_HEADS: Tx.constexpr,
+    HEAD_DIM: Tx.constexpr,
+    is_causal: Tx.constexpr = False,
+    CTA_GROUP: Tx.constexpr = 1,
+):
+    ...
+```
+
+The public helper specializes those constexpr arguments:
+
+```python
+def get_flash_attention4_kernel(
+    batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, head_dim, is_causal=False
+):
+    return _kernel.specialize(
+        BATCH_SIZE=batch_size,
+        SEQ_LEN_Q=seq_len_q,
+        SEQ_LEN_KV=seq_len_kv,
+        NUM_QO_HEADS=num_qo_heads,
+        NUM_KV_HEADS=num_kv_heads,
+        HEAD_DIM=head_dim,
+        is_causal=is_causal,
+    )
+```
+
+## Device Coordinates
+
+The device-side body starts with current TIRX coordinate APIs:
+
+```python
+Tx.device_entry()
+bx = Tx.cta_id([cta_count])
+wg_id = Tx.warpgroup_id([4])
+warp_id = Tx.warp_id_in_wg([4])
+lane_id = Tx.lane_id([32])
+tid_in_wg = Tx.thread_id_in_wg([128])
+```
+
+There is no `with Tx.kernel()` block and no `parent=...` keyword in the current implementation.
+
+## Storage and Pipelines
+
+The kernel allocates SMEM tiles, barrier pipelines, and TMEM views near the top of the device body:
+
+```python
+pool = Tx.SMEMPool()
+Q_smem = pool.alloc_mma((SMEM_PIPE_DEPTH_Q, BLK_M, HEAD_DIM), "float16")
+K_smem = pool.alloc_mma((SMEM_PIPE_DEPTH_KV, BLK_N, HEAD_DIM), "float16")
+V_smem = K_smem.view(SMEM_PIPE_DEPTH_KV, BLK_N, HEAD_DIM)
+O_smem = pool.alloc_mma((TMEM_PIPE_DEPTH, BLK_M, HEAD_DIM), "float16")
+tmem_addr = pool.alloc([1], "uint32")
+
+kv_pipe = PipelineState(SMEM_PIPE_DEPTH_KV)
+q_load = Pipeline(pool, SMEM_PIPE_DEPTH_Q, full="tma", empty="tcgen05", empty_phase_offset=1)
+kv_load = Pipeline(pool, SMEM_PIPE_DEPTH_KV, full="tma", empty="tcgen05", empty_phase_offset=1)
+s_ready = TCGen05Bar(pool, 2)
+o_ready = TCGen05Bar(pool, 2)
+softmax_corr = Pipeline(pool, 2, full="mbar", empty="mbar", init_full=128, init_empty=128, empty_phase_offset=1)
+pool.commit()
+```
+
+The current pipeline API is `Pipeline` plus `PipelineState`. Older names such as `Pipe.tma(...)` and `RingState(...)` are not used by the latest reference kernel.
+
+TMEM is managed through `Tx.TMEMPool`:
+
+```python
+tmem_pool = Tx.TMEMPool(pool, total_cols=N_COLS_TMEM, cta_group=CTA_GROUP, tmem_addr=tmem_addr)
+tmem = tmem_pool.alloc((128, N_COLS_TMEM), "float32")
+tmem_pool.move_base_to(0)
+tmem_as_f16 = tmem_pool.alloc((128, N_COLS_TMEM * 2), "float16")
+tmem_pool.commit()
+```
+
+The tutorial's TMEM layout figure corresponds to the `S_region`, `P_region`, and `O_region` stage views built from this allocation.
+
+## Source Regions to Read
+
+| Region in the source | What to look for |
+|----------------------|------------------|
+| Kernel signature and `specialize(...)` helper | Shape specialization and persistent launch configuration. |
+| `Tx.device_entry()` and coordinate calls | Four warpgroups, warp roles, lane ids, and CTA task id. |
+| SMEM/TMEM allocation block | Q/K/V/O staging buffers, TMEM slots, and pipeline barriers. |
+| `load_q`, `load_k`, `load_v` helpers | TMA loads and byte-counted `Pipeline(..., full="tma")` handoffs. |
+| `gemm_qk` | Score MMA: Q and K in SMEM produce S in TMEM. |
+| Softmax warpgroup region | TMEM readback of S, row-wise softmax math, and P writeback into the fp16 TMEM view. |
+| `gemm_pv` | Value MMA: P in TMEM and V in SMEM accumulate O in TMEM. |
+| Correction and epilogue region | O rescale, normalization, TMEM readback, SMEM staging, and TMA store. |
+| Scheduler setup | Linear persistent scheduling for non-causal mode and LPT scheduling for causal mode. |
+
+## How to Run It
+
+Use the helper from the reference file:
+
+```python
+from tirx_kernels.attention.flash_attention4 import (
+    PROFILER_BUFFER_SIZE,
+    get_flash_attention4_kernel,
+    prepare_data,
+)
+```
+
+Then compile with the same pattern used elsewhere in the tutorial:
+
+```python
+import numpy as np
+import tvm
+
+kernel = get_flash_attention4_kernel(
+    batch_size, seq_len_q, seq_len_kv, num_qo_heads, num_kv_heads, head_dim, is_causal
+)
+
+target = tvm.target.Target("cuda")
+with target:
+    ex = tvm.compile(tvm.IRModule({"main": kernel}), target=target, tir_pipeline="tirx")
+```
+
+Pass `(Q, K, V, O, profiler_buffer)` to the compiled executable. The profiler buffer is part of the kernel signature even when profiling output is not the focus.
+
+```python
+profiler_buffer = tvm.runtime.tensor(
+    np.zeros(PROFILER_BUFFER_SIZE, dtype=np.uint64), tvm.cuda(0)
+)
+ex(Q, K, V, O, profiler_buffer)
+```
+
+## What Not to Copy Forward
+
+If you see any of the following in an older FA4 snippet, treat it as stale:
+
+- `@Tx.prim_func(tirx=True, persistent=True)`
+- `with Tx.kernel():`
+- coordinate calls with `parent=...`
+- `Pipe.tma(...)`, `Pipe.mbar(...)`, or `Pipe.tcgen05(...)`
+- `RingState(...)`
+- `Tx.elected()`
+
+The latest implementation uses `@Tx.jit(persistent=True)`, `Tx.device_entry()`, parentless coordinate APIs, `Pipeline`, `PipelineState`, explicit barrier wrappers, and `with Tx.thread(Tx.ptx.elect_sync()):` for elected issue paths.
